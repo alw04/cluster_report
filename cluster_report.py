@@ -8,8 +8,24 @@ from subprocess import run
 import xlsxwriter
 
 
+def detect_cluster():
+    result = run(
+        ["scontrol", "show", "config"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "ClusterName":
+            return value.strip().lower()
+
+    raise RuntimeError("Could not find ClusterName in Slurm's configuration.")
+
+
 def collect_utilization(start_date, end_date):
-    columns = [
+    fields = [
         "Allocated",
         "Down",
         "PlannedDown",
@@ -27,7 +43,7 @@ def collect_utilization(start_date, end_date):
             "hour",
             f"start={start_date}",
             f"end={end_date}",
-            f"format={','.join(columns)}",
+            f"format={','.join(fields)}",
             "-P",
             "-n",
         ],
@@ -36,66 +52,75 @@ def collect_utilization(start_date, end_date):
         check=True,
     )
 
-    values = result.stdout.strip().split("|")
-    return dict(zip(columns, map(int, values)))
+    rows = [line for line in result.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise ValueError(f"Expected one sreport utilization row, got {len(rows)}.")
+
+    values = rows[0].split("|")
+    if len(values) != len(fields):
+        raise ValueError(
+            f"Expected {len(fields)} sreport fields, got {len(values)}: {rows[0]!r}"
+        )
+
+    return dict(zip(fields, map(int, values)))
 
 
-def collect_jobs(start_date, end_date):
-    columns = [
-        "Account",
-        "CPUTimeRAW",
-    ]
+def collect_jobs(start_date, end_date, *, cluster, use_sudo=False):
+    fields = ["Account", "CPUTimeRAW"]
+    command = ["sudo", "sacct"] if use_sudo else ["sacct"]
 
-    result = run(
+    if cluster == "atlas":
+        command.append("-a")
+        fields.append("ReqTRES")
+
+    command.extend(
         [
-            "sudo",
-            "sacct",
             "--truncate",
             f"--start={start_date}",
             f"--end={end_date}",
-            f"--format={','.join(columns)}",
+            f"--format={','.join(fields)}",
             "-P",
             "-X",
             "-n",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
+        ]
     )
 
-    jobs = []
+    result = run(command, capture_output=True, text=True, check=True)
 
+    jobs = []
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
 
         values = line.split("|")
-        job = dict(zip(columns, values))
+        if len(values) != len(fields):
+            raise ValueError(f"Unexpected sacct row: {line!r}")
+
+        job = dict(zip(fields, values))
         job["CPUTimeRAW"] = int(job["CPUTimeRAW"])
         jobs.append(job)
 
     return jobs
 
 
-def collect_filesystem_usage():
+def collect_filesystem_usage(*, include_lts):
+    fields = "--output=target,size,used,avail,pcent"
     commands = [
-        [
-            "df",
-            "-B1",
-            "--output=target,size,used,avail,pcent",
-            "/project",
-            "/90daydata",
-        ],
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=15",
-            "nal-dtn-0.scinet.usda.gov",
-            "df -B1 --output=target,size,used,avail,pcent /LTS/project",
-        ],
+        ["df", "-B1", fields, "/project", "/90daydata"],
     ]
+
+    if include_lts:
+        commands.append(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "nal-dtn-0.scinet.usda.gov",
+                f"df -B1 {fields} /LTS/project",
+            ]
+        )
 
     filesystems = []
 
@@ -123,45 +148,117 @@ def collect_filesystem_usage():
     return filesystems
 
 
-def collect_project_storage():
+def collect_ceres_project_storage():
     text = Path("/system/vast_quotas/view_vast_quotas").read_text()
 
     projects = []
-    columns = None
+    fields = None
+    required_fields = {
+        "Path",
+        "Pretty-state",
+        "Used-effective-capacity",
+        "Hard-limit",
+    }
 
-    for line in text.splitlines():
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
         if not line.startswith("|"):
             continue
 
-        values = [value.strip() for value in line.strip().strip("|").split("|")]
+        values = [value.strip() for value in line[1:].removesuffix("|").split("|")]
 
         if values[0] == "Id":
-            columns = values
+            fields = values
+            missing_fields = required_fields.difference(fields)
+            if missing_fields:
+                missing_names = ", ".join(sorted(missing_fields))
+                raise ValueError(
+                    f"Ceres quota header is missing fields: {missing_names}"
+                )
             continue
 
-        if columns is None:
+        if fields is None:
             continue
 
-        row = dict(zip(columns, values))
+        if len(values) != len(fields):
+            raise ValueError(
+                f"Unexpected Ceres quota row on line {line_number}: "
+                f"expected {len(fields)} fields, got {len(values)}."
+            )
+
+        row = dict(zip(fields, values))
         path = row["Path"]
 
         if not path.startswith("/project/"):
             continue
 
+        usage = row["Used-effective-capacity"]
+        quota = row["Hard-limit"]
+
         projects.append(
             {
                 "Project": path.removeprefix("/project/"),
                 "State": row["Pretty-state"],
-                "UsedBytes": (
-                    int(row["Used-effective-capacity"])
-                    if row["Used-effective-capacity"] != "None"
-                    else None
-                ),
-                "QuotaBytes": (
-                    int(row["Hard-limit"]) if row["Hard-limit"] != "None" else None
-                ),
+                "UsedBytes": None if usage == "None" else int(usage),
+                "QuotaBytes": None if quota == "None" else int(quota),
             }
         )
+
+    if fields is None:
+        raise ValueError(
+            "Could not find the Ceres quota table header "
+            "(expected 'Id' as the first field.)"
+        )
+
+    if not projects:
+        raise ValueError("No /project/ rows found in the Ceres quota report.")
+
+    return projects
+
+
+def collect_atlas_project_storage():
+    result = run(
+        ["my_quota", "-r"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    projects = []
+    found_header = False
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+
+        if line.startswith("Directory/Group"):
+            found_header = True
+            continue
+
+        if not found_header or not line or set(line) == {"-"}:
+            continue
+
+        fields = line.split()
+        if len(fields) != 4:
+            raise ValueError(f"Unexpected Atlas quota row: {line!r}")
+
+        group, usage, quota, percent = fields
+        projects.append(
+            {
+                "Project": group,
+                "UsedGB": usage if usage == "<1" else int(usage),
+                "QuotaGB": quota if quota == "<1" else int(quota),
+                "UsedPercent": int(percent),
+            }
+        )
+
+    if not found_header:
+        raise ValueError(
+            "Could not find the Atlas quota table header "
+            "(expected it to start with 'Directory/Group')."
+        )
+
+    if not projects:
+        raise ValueError("No project rows found in the Atlas quota report.")
 
     return projects
 
@@ -198,34 +295,48 @@ def summarize_jobs(jobs):
     }
 
 
-def summarize_project_storage(projects):
+def summarize_project_storage(projects, *, cluster):
     storage = []
 
-    for project in projects:
-        if project["Project"] == "rm_projects":
-            continue
+    if cluster == "atlas":
+        unit = "GB"
+        for project in projects:
+            storage.append(
+                {
+                    "Project": project["Project"],
+                    "Used": project["UsedGB"],
+                    "Quota": project["QuotaGB"],
+                }
+            )
+    elif cluster == "ceres":
+        unit = "TiB"
+        for project in projects:
+            if (
+                project["Project"] == "rm_projects"
+                or project["State"] == "FAILED"
+                or project["UsedBytes"] is None
+            ):
+                continue
 
-        if project["State"] == "FAILED":
-            continue
+            quota = project["QuotaBytes"]
+            storage.append(
+                {
+                    "Project": project["Project"],
+                    "Used": project["UsedBytes"] / 1024**4,
+                    "Quota": quota / 1024**4 if quota is not None else None,
+                }
+            )
+    else:
+        raise ValueError(f"Unsupported cluster: {cluster!r}")
 
-        if project["UsedBytes"] is None:
-            continue
+    def usage_sort_key(project):
+        used = project["Used"]
+        return 0.5 if used == "<1" else used
 
-        storage.append(
-            {
-                "Project": project["Project"],
-                "UsedTiB": project["UsedBytes"] / 1024**4,
-                "QuotaTiB": (
-                    project["QuotaBytes"] / 1024**4
-                    if project["QuotaBytes"] is not None
-                    else None
-                ),
-            }
-        )
-
-    storage.sort(key=lambda project: project["UsedTiB"], reverse=True)
+    storage.sort(key=usage_sort_key, reverse=True)
 
     return {
+        "Unit": unit,
         "UsageByProject": storage,
         "Top10Projects": storage[:10],
     }
@@ -254,9 +365,34 @@ def summarize_filesystem_usage(filesystems):
     ]
 
 
+def summarize_gpu_jobs(jobs):
+    job_count = 0
+    cpu_seconds = 0
+
+    for job in jobs:
+        for resource in job["ReqTRES"].split(","):
+            name, separator, count = resource.strip().partition("=")
+
+            if separator and (name == "gres/gpu" or name.startswith("gres/gpu:")):
+                if int(count) > 0:
+                    job_count += 1
+                    cpu_seconds += job["CPUTimeRAW"]
+                    break
+
+    return {
+        "JobCount": job_count,
+        "CPUHours": cpu_seconds / 3600,
+    }
+
+
 def write_excel_report(summary, start_date, end_date, output_path):
     with xlsxwriter.Workbook(output_path) as workbook:
         sheet = workbook.add_worksheet("Cluster Report")
+
+        project_storage = summary["project_storage"]
+        storage_unit = project_storage["Unit"]
+        used_header = f"Used ({storage_unit})"
+        quota_header = f"Quota ({storage_unit})"
 
         heading = workbook.add_format({"bold": True})
         integer = workbook.add_format({"num_format": "#,##0"})
@@ -310,22 +446,33 @@ def write_excel_report(summary, start_date, end_date, output_path):
                 cell_format,
             )
 
-        sheet.set_column("D:E", 22)
+        row = 14
 
+        if "gpu_jobs" in summary:
+            gpu = summary["gpu_jobs"]
+            sheet.write_row(row, 0, ["GPU-Requesting Jobs", "Period"], heading)
+            sheet.write(row + 1, 0, "Job Count")
+            sheet.write_number(row + 1, 1, gpu["JobCount"], integer)
+            sheet.write(row + 2, 0, "Allocated CPU Hours")
+            sheet.write_number(row + 2, 1, gpu["CPUHours"], decimal)
+            row += 4
+
+        sheet.set_column("D:E", 22)
         sheet.write_row(
-            "A15",
+            row,
+            0,
             ["Filesystem", "Size (TiB)", "Used (TiB)", "Available (TiB)", "Used (%)"],
             heading,
         )
 
-        for row, filesystem in enumerate(summary["filesystems"], start=15):
-            sheet.write(row, 0, filesystem["Mount"])
-            sheet.write(row, 1, filesystem["SizeTiB"], decimal)
-            sheet.write(row, 2, filesystem["UsedTiB"], decimal)
-            sheet.write(row, 3, filesystem["AvailableTiB"], decimal)
-            sheet.write(row, 4, filesystem["UsedFraction"], percent)
+        for fs_row, filesystem in enumerate(summary["filesystems"], start=row + 1):
+            sheet.write(fs_row, 0, filesystem["Mount"])
+            sheet.write(fs_row, 1, filesystem["SizeTiB"], decimal)
+            sheet.write(fs_row, 2, filesystem["UsedTiB"], decimal)
+            sheet.write(fs_row, 3, filesystem["AvailableTiB"], decimal)
+            sheet.write(fs_row, 4, filesystem["UsedFraction"], percent)
 
-        row = 15 + len(summary["filesystems"]) + 2
+        row += len(summary["filesystems"]) + 2
 
         sheet.write_row(
             row,
@@ -340,26 +487,21 @@ def write_excel_report(summary, start_date, end_date, output_path):
             sheet.write(row, 1, account["CPUHours"], decimal)
             row += 1
 
-        row += 2
+        row += 1
 
         sheet.write_row(
             row,
             0,
-            ["Top 10 Storage Projects", "Used (TiB)", "Quota (TiB)"],
+            ["Top 10 Storage Projects", used_header, quota_header],
             heading,
         )
-
         row += 1
 
-        for project in summary["project_storage"]["Top10Projects"]:
-            sheet.write(row, 0, project["Project"])
-            sheet.write(row, 1, project["UsedTiB"], decimal)
-            sheet.write(
-                row,
-                2,
-                project["QuotaTiB"] if project["QuotaTiB"] is not None else "N/A",
-                decimal,
-            )
+        for project in project_storage["Top10Projects"]:
+            sheet.write_string(row, 0, project["Project"])
+            sheet.write(row, 1, project["Used"], decimal)
+            quota = project["Quota"]
+            sheet.write(row, 2, quota if quota is not None else "N/A", decimal)
             row += 1
 
         compute_sheet = workbook.add_worksheet("Compute Usage")
@@ -389,21 +531,17 @@ def write_excel_report(summary, start_date, end_date, output_path):
 
         storage_sheet.write_row(
             "A1",
-            ["Project", "Used (TiB)", "Quota (TiB)"],
+            ["Project", used_header, quota_header],
             heading,
         )
 
-        projects = summary["project_storage"]["UsageByProject"]
+        projects = project_storage["UsageByProject"]
 
         for row, project in enumerate(projects, start=1):
             storage_sheet.write_string(row, 0, project["Project"])
-            storage_sheet.write(row, 1, project["UsedTiB"], decimal)
-            storage_sheet.write(
-                row,
-                2,
-                project["QuotaTiB"] if project["QuotaTiB"] is not None else "N/A",
-                decimal,
-            )
+            storage_sheet.write(row, 1, project["Used"], decimal)
+            quota = project["Quota"]
+            storage_sheet.write(row, 2, quota if quota is not None else "N/A", decimal)
 
         if projects:
             storage_sheet.autofilter(0, 0, len(projects), 2)
@@ -444,7 +582,7 @@ def write_excel_report(summary, start_date, end_date, output_path):
                 )
 
             chart.set_title({"name": "Top 10 Projects by Storage Used"})
-            chart.set_x_axis({"name": "TiB", "min": 0})
+            chart.set_x_axis({"name": storage_unit, "min": 0})
             chart.set_y_axis({"reverse": True})
             chart.set_legend({"position": "bottom"})
             chart.set_size({"width": 800, "height": 500})
@@ -463,11 +601,15 @@ def write_excel_report(summary, start_date, end_date, output_path):
             ),
             (
                 storage_sheet,
-                summary["project_storage"]["UsageByProject"],
+                projects,
                 "Project",
-                "UsedTiB",
-                "Used (TiB)",
-                "Project Storage Usage Share",
+                "Used",
+                used_header,
+                (
+                    "Project Storage Share (excludes usage <1 GB)"
+                    if storage_unit == "GB"
+                    else "Project Storage Usage Share"
+                ),
                 "T31",
             ),
         ]
@@ -481,6 +623,12 @@ def write_excel_report(summary, start_date, end_date, output_path):
             title,
             position,
         ) in pie_configs:
+            records = [
+                record
+                for record in records
+                if isinstance(record[value_key], (int, float))
+            ]
+
             slices = [(record[name_key], record[value_key]) for record in records[:10]]
 
             other = sum(record[value_key] for record in records[10:])
@@ -554,7 +702,8 @@ def parse_args():
     parser.add_argument(
         "--output",
         metavar="FILE.xlsx",
-        help="Output Excel filename " "(defaults to cluster-report-START-to-END.xlsx)",
+        help="Output Excel filename "
+        "(defaults to <cluster>-report-<start>-to-<end>.xlsx)",
     )
 
     args = parser.parse_args()
@@ -567,27 +716,40 @@ def parse_args():
 
 def main():
     args = parse_args()
+    cluster = detect_cluster()
 
-    data = {
-        "utilization": collect_utilization(args.start, args.end),
-        "utilization_ytd": collect_utilization(
-            args.start.replace(month=1, day=1),
-            args.end,
-        ),
-        "jobs": collect_jobs(args.start, args.end),
-        "filesystems": collect_filesystem_usage(),
-        "project_storage": collect_project_storage(),
-    }
+    if cluster == "ceres":
+        collect_project_storage = collect_ceres_project_storage
+    elif cluster == "atlas":
+        collect_project_storage = collect_atlas_project_storage
+    else:
+        raise SystemExit(f"Unsupported Slurm cluster: {cluster!r}")
+
+    jobs = collect_jobs(
+        args.start,
+        args.end,
+        cluster=cluster,
+        use_sudo=(cluster == "ceres"),
+    )
 
     summary = {
-        "utilization": summarize_utilization(data["utilization"]),
-        "utilization_ytd": summarize_utilization(data["utilization_ytd"]),
-        "jobs": summarize_jobs(data["jobs"]),
-        "filesystems": summarize_filesystem_usage(data["filesystems"]),
-        "project_storage": summarize_project_storage(data["project_storage"]),
+        "utilization": summarize_utilization(collect_utilization(args.start, args.end)),
+        "utilization_ytd": summarize_utilization(
+            collect_utilization(args.start.replace(month=1, day=1), args.end)
+        ),
+        "jobs": summarize_jobs(jobs),
+        "filesystems": summarize_filesystem_usage(
+            collect_filesystem_usage(include_lts=(cluster == "ceres"))
+        ),
+        "project_storage": summarize_project_storage(
+            collect_project_storage(), cluster=cluster
+        ),
     }
 
-    output_path = args.output or f"cluster-report-{args.start}-to-{args.end}.xlsx"
+    if cluster == "atlas":
+        summary["gpu_jobs"] = summarize_gpu_jobs(jobs)
+
+    output_path = args.output or f"{cluster}-report-{args.start}-to-{args.end}.xlsx"
 
     write_excel_report(summary, args.start, args.end, output_path)
     print(f"Report saved to {output_path}")
